@@ -4,6 +4,8 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::UdpSocket;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -67,6 +69,10 @@ fn send_server_list(sock: &UdpSocket, from: SocketAddr, key: u32, servers: Vec<S
     if let Err(err) = sock.send_to(&response, from) {
         println!("error sending server list to {from}: {err}");
     }
+}
+
+fn send_live_server(sock: &UdpSocket, from: SocketAddr, key: u32, server: SocketAddrV4) {
+    send_server_list(sock, from, key, vec![server]);
 }
 
 fn handle_connect(user: &User, args: &[&str], from: SocketAddr, sock: &UdpSocket) {
@@ -215,12 +221,59 @@ fn handle_servers(
     };
 
     let expected_gamedir = gamedir.clone();
+    let discovered_servers = Arc::new(Mutex::new(HashSet::<SocketAddrV4>::new()));
+    let any_live_updates = Arc::new(AtomicBool::new(false));
+
+    let refreshed_socket = match callback_socket.try_clone() {
+        Ok(sock) => sock,
+        Err(err) => {
+            println!("handle_servers: failed to clone refreshed socket: {err}");
+            send_server_list(&callback_socket, from, key, Vec::new());
+            return;
+        }
+    };
+    let refreshed_gamedir = expected_gamedir.clone();
+    let refreshed_discovered = Arc::clone(&discovered_servers);
+    let refreshed_live_flag = Arc::clone(&any_live_updates);
     let callbacks = ServerListCallbacks::new(
-        Box::new(|_request, _server| {}),
+        Box::new(move |request, server_index| {
+            let request = request.lock().unwrap();
+            let Ok(details) = request.get_server_details(server_index) else {
+                return;
+            };
+
+            if !details.successful_response {
+                return;
+            }
+
+            if !refreshed_gamedir.is_empty()
+                && !details.game_dir.eq_ignore_ascii_case(&refreshed_gamedir)
+            {
+                return;
+            }
+
+            let port = if details.connection_port != 0 {
+                details.connection_port
+            } else {
+                details.query_port
+            };
+
+            if port == 0 {
+                return;
+            }
+
+            let server = SocketAddrV4::new(details.addr, port);
+            let mut discovered = refreshed_discovered.lock().unwrap();
+
+            if discovered.insert(server) {
+                refreshed_live_flag.store(true, Ordering::Relaxed);
+                send_live_server(&refreshed_socket, from, key, server);
+            }
+        }),
         Box::new(|_request, _server| {}),
         Box::new(move |request, response| {
             let mut request = request.lock().unwrap();
-            let mut unique_servers = HashSet::new();
+            let mut unique_servers = discovered_servers.lock().unwrap().clone();
             let count = request.get_server_count().unwrap_or(0);
 
             for server_index in 0..count {
@@ -261,7 +314,13 @@ fn handle_servers(
                 "steam query finished for {expected_gamedir} (appid {app_id}) with {response:?}, {} servers",
                 servers.len()
             );
-            send_server_list(&callback_socket, from, key, servers);
+
+            if !any_live_updates.load(Ordering::Relaxed) || servers.is_empty() {
+                send_server_list(&callback_socket, from, key, servers);
+            } else {
+                // send a terminating packet so the client can mark the request as completed.
+                send_server_list(&callback_socket, from, key, Vec::new());
+            }
         }),
     );
 
